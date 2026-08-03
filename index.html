@@ -44,6 +44,9 @@
 
   main{max-width:880px;margin:0 auto;padding:20px 16px 150px;}
   .group-banner{background:#fff4e9;border:1px solid var(--orange);color:var(--orange-dark);font-size:13px;font-weight:600;padding:10px 14px;border-radius:10px;margin-bottom:14px;}
+  .sync-banner{background:#fff8e1;border:1px solid #e0b338;color:#8a6d1f;font-size:12.5px;font-weight:600;padding:8px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;position:sticky;top:73px;z-index:9;}
+  .sync-banner button{background:transparent;border:1px solid #e0b338;color:#8a6d1f;padding:4px 10px;font-size:11px;font-weight:600;border-radius:6px;flex-shrink:0;}
+  .sync-banner button:hover{background:#f5e6b8;}
   .toolbar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center;}
   .toolbar .btn-ghost{font-size:12px;padding:7px 12px;}
   .shift-select{padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;font-family:inherit;background:#fff;color:var(--text);}
@@ -139,6 +142,11 @@
   </div>
 </header>
 
+<div class="sync-banner hidden" id="syncBanner">
+  <span id="syncBannerText">0 data absen menunggu sinkronisasi</span>
+  <button id="syncNowBtn">Sinkron Sekarang</button>
+</div>
+
 <main>
   <!-- ===== VIEW: BERANDA (absen) ===== -->
   <div id="view-absen">
@@ -233,6 +241,182 @@ const CONFIG = {
   API_URL: "https://script.google.com/macros/s/AKfycbxuaezwNBTfbAd7fapaLBSHLwKHlCAlW2Q49_rXCo_8K3WmUewBZcjhCoVz1Fz--U74/exec"
 };
 
+// Wrapper fetch khusus untuk Apps Script Web App.
+// Kadang Google balikin halaman HTML (redirect login / error server) alih-alih JSON,
+// atau kadang nggak respons sama sekali (hang). Helper ini:
+// 1. Timeout per percobaan (15 detik) — fetch bawaan browser nggak ada batas waktu,
+//    jadi tanpa ini, request yang macet bikin tombol/modal nyangkut selamanya.
+// 2. Retry otomatis (maks 2x) kalau respons bukan JSON valid, network gagal, atau timeout.
+// 3. Kalau tetap gagal, pesan error berisi cuplikan respons asli (bukan cuma "Unexpected token")
+//    supaya penyebabnya kelihatan jelas.
+async function fetchJSON_(url, options, retries = 2, timeoutMs = 15000){
+  let lastErr;
+  for(let attempt = 0; attempt <= retries; attempt++){
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try{
+      const res = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+      const text = await res.text();
+      let data;
+      try{
+        data = JSON.parse(text);
+      }catch(parseErr){
+        const snippet = text.slice(0, 120).replace(/\s+/g, ' ').trim();
+        throw new Error(`Server balas bukan JSON (HTTP ${res.status})${snippet ? ': ' + snippet : ''}`);
+      }
+      return data;
+    }catch(err){
+      lastErr = err.name === 'AbortError' ? new Error('Server tidak merespons (timeout)') : err;
+      if(attempt < retries) await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+    }finally{
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr;
+}
+
+// ================= OFFLINE STORAGE (IndexedDB) =================
+// Store 'cache'   : snapshot terakhir daftar peserta + siapa yang sudah absen hari ini per grup,
+//                   dipakai kalau device offline saat buka Beranda.
+// Store 'pending' : antrean absen yang gagal dikirim karena offline, disinkron otomatis
+//                   begitu jaringan kembali.
+const OFFLINE_DB_NAME = 'p5m_offline_db';
+function openOfflineDB_(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+    req.onupgradeneeded = (e)=>{
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains('cache')) db.createObjectStore('cache', { keyPath: 'group' });
+      if(!db.objectStoreNames.contains('pending')) db.createObjectStore('pending', { keyPath: 'id', autoIncrement: true });
+    };
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+async function idbPut_(storeName, value){
+  const db = await openOfflineDB_();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = ()=> resolve();
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+async function idbGet_(storeName, key){
+  const db = await openOfflineDB_();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+async function idbGetAll_(storeName){
+  const db = await openOfflineDB_();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = ()=> resolve(req.result || []);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+async function idbDelete_(storeName, key){
+  const db = await openOfflineDB_();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+    tx.oncomplete = ()=> resolve();
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+
+// Nama peserta yang sudah diantrekan (belum sinkron) untuk grup tertentu,
+// supaya tidak muncul dobel di daftar Beranda selagi masih menunggu sinkron.
+async function getLocalPendingNames_(group){
+  const all = await idbGetAll_('pending').catch(()=>[]);
+  const set = new Set();
+  all.filter(e => e.group === group).forEach(e => e.rows.forEach(r => set.add(normalizeName_(r.nama))));
+  return set;
+}
+
+// Coba tampilkan Beranda dari cache lokal (dipakai saat offline / fetch gagal).
+// Mengembalikan true kalau berhasil tampil dari cache, false kalau tidak ada cache.
+async function loadParticipantsFromCache_(showOfflineToast = true){
+  try{
+    const cached = await idbGet_('cache', currentGroup);
+    if(!cached) return false;
+    const alreadyTodayServer = new Set(cached.alreadyToday || []);
+    const localPendingNames = await getLocalPendingNames_(currentGroup);
+    const alreadyToday = new Set([...alreadyTodayServer, ...localPendingNames]);
+    const allParticipants = cached.names.map(item => ({
+      nama: item.nama, jabatan: item.jabatan || '',
+      status: '', catatan: '',
+      backupNama: '', backupJabatan: '', backupCatatan: ''
+    }));
+    skippedTodayCount = allParticipants.filter(p => alreadyToday.has(normalizeName_(p.nama))).length;
+    participants = allParticipants.filter(p => !alreadyToday.has(normalizeName_(p.nama)));
+    renderList();
+    if(showOfflineToast){
+      const ageMin = Math.max(0, Math.round((Date.now() - cached.cachedAt) / 60000));
+      showToast(`Offline — pakai data tersimpan (${ageMin} menit lalu)`, 'error');
+    }
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+let syncInProgress_ = false;
+// Kirim semua absen yang tertunda di IndexedDB ke server. Berhenti di entri pertama
+// yang masih gagal (kemungkinan masih offline) supaya tidak spam retry; siklus
+// berikutnya (event 'online' atau interval) akan coba lagi dari situ.
+async function trySyncPending_(){
+  if(syncInProgress_ || !navigator.onLine) { updateSyncBanner_(); return; }
+  syncInProgress_ = true;
+  try{
+    const all = await idbGetAll_('pending').catch(()=>[]);
+    let syncedCount = 0;
+    for(const entry of all){
+      try{
+        const data = await fetchJSON_(CONFIG.API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: 'saveAttendance', group: entry.group, rows: entry.rows })
+        }, 0, 10000);
+        if(data && data.ok){
+          await idbDelete_('pending', entry.id);
+          syncedCount++;
+          if(entry.group === currentGroup) historyNeedsReload = true;
+        }else{
+          break; // gagal karena alasan server, jangan lanjut nyoba entri lain dulu
+        }
+      }catch(err){
+        break; // kemungkinan masih offline, coba lagi di siklus berikutnya
+      }
+    }
+    if(syncedCount > 0){
+      showToast(`${syncedCount} absen offline berhasil disinkronkan`, 'ok');
+      if(historyNeedsReload && !document.getElementById('view-riwayat').classList.contains('hidden')) loadHistory();
+    }
+  }finally{
+    syncInProgress_ = false;
+    updateSyncBanner_();
+  }
+}
+
+async function updateSyncBanner_(){
+  const banner = document.getElementById('syncBanner');
+  if(!banner) return;
+  const all = await idbGetAll_('pending').catch(()=>[]);
+  if(all.length === 0){
+    banner.classList.add('hidden');
+  }else{
+    banner.classList.remove('hidden');
+    document.getElementById('syncBannerText').textContent =
+      `${all.length} data absen menunggu sinkronisasi${navigator.onLine ? '' : ' (offline)'}`;
+  }
+}
+
 // Per grup: apakah butuh Shift, apakah punya kolom Back Up (PIT saja)
 const DEFAULT_SHIFTS = ["Shift Pagi", "Shift Malam"];
 const GROUP_CONFIG = {
@@ -248,7 +432,8 @@ const GROUP_CONFIG = {
   "Sampler":     { shift:true,  backup:false },
   "Fuel Man":    { shift:false, backup:false },
   "Kitchen":     { shift:false, backup:false },
-  "LAB":         { shift:false, backup:false }
+  "LAB":         { shift:false, backup:false },
+  "EKSPLORASI":  { shift:false, backup:false }
 };
 function configFor(group){
   const cfg = GROUP_CONFIG[group] || { shift:false, backup:false };
@@ -320,11 +505,10 @@ async function initOnboarding(){
     return;
   }
   document.getElementById('onboardModal').classList.remove('hidden');
+  const select = document.getElementById('onboardGroupSelect');
   try{
-    const res = await fetch(`${CONFIG.API_URL}?action=getGroups`);
-    const data = await res.json();
+    const data = await fetchJSON_(`${CONFIG.API_URL}?action=getGroups`);
     if(!data.ok) throw new Error(data.error || 'Gagal memuat grup');
-    const select = document.getElementById('onboardGroupSelect');
     if(!data.groups || data.groups.length === 0){
       select.innerHTML = '<option value="">Belum ada grup di Master Data</option>';
       return;
@@ -332,6 +516,7 @@ async function initOnboarding(){
     select.innerHTML = '<option value="">-- Pilih Grup --</option>' +
       data.groups.map(g => `<option value="${g}">${g}</option>`).join('');
   }catch(err){
+    select.innerHTML = '<option value="">Gagal memuat, coba lagi</option>';
     showToast('Gagal memuat daftar grup: ' + err.message, 'error');
   }
 }
@@ -375,8 +560,7 @@ function attemptChangeGroup(){
   const btn = document.getElementById('pinConfirmBtn');
   btn.disabled = true;
   btn.textContent = 'Memeriksa...';
-  fetch(`${CONFIG.API_URL}?action=getPin`)
-    .then(res => res.json())
+  fetchJSON_(`${CONFIG.API_URL}?action=getPin`)
     .then(data => {
       if(!data.ok) throw new Error(data.error || 'Gagal memeriksa sandi');
       if(val !== data.pin){ showToast('Sandi salah', 'error'); return; }
@@ -400,17 +584,27 @@ async function loadParticipants(){
   const card = document.getElementById('listCard');
   card.innerHTML = '<div class="loading">Memuat data peserta...</div>';
   openExtras.clear();
+
+  if(!navigator.onLine){
+    const shown = await loadParticipantsFromCache_();
+    if(shown) return;
+    // nggak ada cache sama sekali (belum pernah online di grup ini) — tetap coba fetch di bawah,
+    // siapa tau navigator.onLine salah deteksi.
+  }
+
   try{
     const [namesData, historyData] = await Promise.all([
-      fetch(`${CONFIG.API_URL}?action=getNames&group=${encodeURIComponent(currentGroup)}`).then(r=>r.json()),
-      fetch(`${CONFIG.API_URL}?action=getHistory&group=${encodeURIComponent(currentGroup)}&date=${encodeURIComponent(todayISO())}`).then(r=>r.json())
+      fetchJSON_(`${CONFIG.API_URL}?action=getNames&group=${encodeURIComponent(currentGroup)}`),
+      fetchJSON_(`${CONFIG.API_URL}?action=getHistory&group=${encodeURIComponent(currentGroup)}&date=${encodeURIComponent(todayISO())}`)
     ]);
     if(!namesData.ok) throw new Error(namesData.error || 'Gagal memuat data');
 
-    const alreadyToday = new Set();
+    const alreadyTodayServer = new Set();
     if(historyData.ok && historyData.rows){
-      historyData.rows.forEach(r => alreadyToday.add(normalizeName_(r.nama)));
+      historyData.rows.forEach(r => alreadyTodayServer.add(normalizeName_(r.nama)));
     }
+    const localPendingNames = await getLocalPendingNames_(currentGroup);
+    const alreadyToday = new Set([...alreadyTodayServer, ...localPendingNames]);
 
     const allParticipants = namesData.names.map(item => ({
       nama: item.nama, jabatan: item.jabatan || '',
@@ -420,7 +614,18 @@ async function loadParticipants(){
     skippedTodayCount = allParticipants.filter(p => alreadyToday.has(normalizeName_(p.nama))).length;
     participants = allParticipants.filter(p => !alreadyToday.has(normalizeName_(p.nama)));
     renderList();
+
+    // simpan snapshot buat dipakai offline nanti (alreadyToday dari server saja, bukan gabungan,
+    // supaya begitu antrean lokal sinkron, statusnya tetap akurat)
+    idbPut_('cache', {
+      group: currentGroup,
+      names: namesData.names,
+      alreadyToday: Array.from(alreadyTodayServer),
+      cachedAt: Date.now()
+    }).catch(()=>{});
   }catch(err){
+    const shown = await loadParticipantsFromCache_();
+    if(shown) return;
     card.innerHTML = `<div class="empty">Gagal memuat data peserta.<br>${err.message}</div>`;
     showToast('Gagal memuat data peserta', 'error');
   }
@@ -554,30 +759,50 @@ document.getElementById('saveBtn').addEventListener('click', async ()=>{
     keteranganBackUp: cfg.backup ? (p.backupCatatan || '') : ''
   }));
 
+  let data = null;
+  let networkFailed = false;
   try{
-    const res = await fetch(CONFIG.API_URL, {
+    data = await fetchJSON_(CONFIG.API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({ action: 'saveAttendance', group: currentGroup, rows })
-    });
-    const data = await res.json();
-    if(!data.ok) throw new Error(data.error || 'Gagal menyimpan');
-    if(data.skipped > 0){
-      showToast(`Tersimpan ${data.saved} · ${data.skipped} dilewati (sudah absen hari ini)`, data.saved > 0 ? 'ok' : 'error');
-    }else{
-      showToast(`Berhasil menyimpan ${data.saved} absensi ke "${currentGroup}"`, 'ok');
-    }
-    const savedSet = new Set(toSave.map(p => p.nama));
-    participants = participants.filter(p => !savedSet.has(p.nama));
-    skippedTodayCount += toSave.length;
-    renderList();
-    if(data.saved > 0) historyNeedsReload = true;
+    }, 1, 10000);
   }catch(err){
-    showToast('Gagal menyimpan: ' + err.message, 'error');
-  }finally{
-    btn.textContent = 'Simpan Semua';
-    updateSummary();
+    networkFailed = true;
   }
+
+  if(networkFailed){
+    try{
+      await idbPut_('pending', { group: currentGroup, rows, createdAt: Date.now() });
+      const savedSet = new Set(toSave.map(p => p.nama));
+      participants = participants.filter(p => !savedSet.has(p.nama));
+      skippedTodayCount += toSave.length;
+      renderList();
+      showToast(`Tersimpan offline (${toSave.length}) — akan disinkron otomatis saat ada jaringan`, 'ok');
+      updateSyncBanner_();
+    }catch(idbErr){
+      showToast('Gagal menyimpan, dan gagal juga disimpan offline: ' + idbErr.message, 'error');
+    }
+  }else{
+    try{
+      if(!data.ok) throw new Error(data.error || 'Gagal menyimpan');
+      if(data.skipped > 0){
+        showToast(`Tersimpan ${data.saved} · ${data.skipped} dilewati (sudah absen hari ini)`, data.saved > 0 ? 'ok' : 'error');
+      }else{
+        showToast(`Berhasil menyimpan ${data.saved} absensi ke "${currentGroup}"`, 'ok');
+      }
+      const savedSet = new Set(toSave.map(p => p.nama));
+      participants = participants.filter(p => !savedSet.has(p.nama));
+      skippedTodayCount += toSave.length;
+      renderList();
+      if(data.saved > 0) historyNeedsReload = true;
+      trySyncPending_(); // sekalian flush antrean lama kalau ada
+    }catch(err){
+      showToast('Gagal menyimpan: ' + err.message, 'error');
+    }
+  }
+  btn.textContent = 'Simpan Semua';
+  updateSummary();
 });
 
 // ================= RIWAYAT =================
@@ -611,8 +836,7 @@ async function loadHistory(){
   const dateVal = document.getElementById('historyDateInput').value;
   const cfg = configFor(currentGroup);
   try{
-    const res = await fetch(`${CONFIG.API_URL}?action=getHistory&group=${encodeURIComponent(currentGroup)}&date=${encodeURIComponent(dateVal)}`);
-    const data = await res.json();
+    const data = await fetchJSON_(`${CONFIG.API_URL}?action=getHistory&group=${encodeURIComponent(currentGroup)}&date=${encodeURIComponent(dateVal)}`);
     historyLoadedOnce = true;
     historyNeedsReload = false;
     if(!data.ok){ card.innerHTML = `<div class="empty">${data.error || 'Gagal memuat riwayat'}</div>`; return; }
@@ -664,15 +888,14 @@ async function loadHistory(){
         btn.disabled = true;
         btn.textContent = 'Menghapus...';
         try{
-          const res3 = await fetch(CONFIG.API_URL, {
+          const data3 = await fetchJSON_(CONFIG.API_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             body: JSON.stringify({
               action: 'deleteAttendance', group: currentGroup, idPeserta: row.idPeserta,
               timestamp: row.timestamp, nama: row.nama
             })
-          });
-          const data3 = await res3.json();
+          }, 1);
           if(!data3.ok) throw new Error(data3.error || 'Gagal menghapus');
           showToast('Absensi dihapus, orang ini muncul lagi di Beranda', 'ok');
           loadHistory();
@@ -717,15 +940,14 @@ async function loadHistory(){
         btn.disabled = true;
         btn.textContent = 'Menyimpan...';
         try{
-          const res2 = await fetch(CONFIG.API_URL, {
+          const data2 = await fetchJSON_(CONFIG.API_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             body: JSON.stringify({
               action: 'updateAttendance', group: currentGroup, idPeserta: row.idPeserta,
               timestamp: row.timestamp, nama: row.nama, keterangan: edit.status, catatan: edit.catatan
             })
-          });
-          const data2 = await res2.json();
+          }, 1);
           if(!data2.ok) throw new Error(data2.error || 'Gagal menyimpan perubahan');
           showToast('Absensi berhasil diubah', 'ok');
           row.keterangan = edit.status;
@@ -815,6 +1037,14 @@ document.getElementById('copyHistoryBtn').addEventListener('click', async ()=>{
 // ================= INIT =================
 document.getElementById('dateLabel').textContent = todayLabel();
 initOnboarding();
+
+// ===== OFFLINE SYNC =====
+document.getElementById('syncNowBtn').addEventListener('click', trySyncPending_);
+window.addEventListener('online', trySyncPending_);
+window.addEventListener('offline', updateSyncBanner_);
+updateSyncBanner_();
+trySyncPending_();
+setInterval(trySyncPending_, 30000); // jaga-jaga kalau event 'online' browser tidak selalu terpicu
 
 if('serviceWorker' in navigator){
   window.addEventListener('load', () => {

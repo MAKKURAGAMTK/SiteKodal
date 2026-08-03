@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p5m-mkg-v1';
+const CACHE_NAME = 'p5m-mkg-v4';
 const APP_SHELL = [
   './',
   './index.html',
@@ -12,7 +12,18 @@ const APP_SHELL = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL))
+    caches.open(CACHE_NAME).then((cache) =>
+      // Per-file, bukan cache.addAll (all-or-nothing). Kalau satu file (misal salah
+      // satu ikon) gagal di-fetch/404, file lain tetap ke-cache — termasuk index.html,
+      // yang paling penting supaya app tetap bisa dibuka offline.
+      Promise.allSettled(
+        APP_SHELL.map((url) =>
+          cache.add(url).catch((err) => {
+            console.warn('[SW] gagal cache:', url, err);
+          })
+        )
+      )
+    )
   );
   self.skipWaiting();
 });
