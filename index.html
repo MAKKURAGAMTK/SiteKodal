@@ -6,6 +6,7 @@
 <title>P5M MKG</title>
 <meta name="theme-color" content="#e8873d">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="P5M MKG">
 <link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
@@ -41,6 +42,9 @@
   .btn-primary{background:var(--orange);color:#fff;padding:10px 20px;font-size:14px;font-weight:600;}
   .btn-primary:hover{background:var(--orange-dark);}
   .btn-primary:disabled{background:#d9c2ba;cursor:not-allowed;}
+  .btn-spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:btn-spin .7s linear infinite;vertical-align:-2px;margin-right:7px;}
+  .btn-ghost .btn-spinner{border:2px solid rgba(0,0,0,.15);border-top-color:var(--text);}
+  @keyframes btn-spin{to{transform:rotate(360deg);}}
 
   main{max-width:880px;margin:0 auto;padding:20px 16px 150px;}
   .group-banner{background:#fff4e9;border:1px solid var(--orange);color:var(--orange-dark);font-size:13px;font-weight:600;padding:10px 14px;border-radius:10px;margin-bottom:14px;}
@@ -80,9 +84,11 @@
 
   .empty, .loading{padding:40px 20px;text-align:center;color:var(--text-mute);font-size:13px;}
 
-  .footer-bar{position:fixed;bottom:56px;left:0;right:0;background:var(--card);border-top:1px solid var(--border);padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;}
+  .footer-bar{position:fixed;bottom:56px;left:0;right:0;background:var(--card);border-top:1px solid var(--border);padding:14px 20px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 12px;}
+  .footer-bar .summary{min-width:0;flex:1 1 auto;}
   .footer-bar .summary{font-size:12px;color:var(--text-mute);}
   .footer-bar .summary b{color:var(--text);}
+  .skipped-badge{display:inline-block;background:#fff4e9;color:var(--orange-dark);border:1px solid var(--orange);border-radius:999px;padding:2px 10px;font-size:11.5px;font-weight:700;margin-left:6px;}
 
   .toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#2b2b2b;color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;z-index:100;opacity:0;pointer-events:none;transition:opacity .2s;}
   .toast.show{opacity:1;}
@@ -138,7 +144,7 @@
     </div>
   </div>
   <div class="header-actions">
-    <button class="btn-ghost" id="refreshBtn">Muat Ulang</button>
+    <button class="btn-ghost" id="refreshBtn" title="Beranda: muat ulang data peserta dari server. Riwayat: muat ulang riwayat.">↻ Muat Ulang</button>
   </div>
 </header>
 
@@ -580,10 +586,19 @@ document.getElementById('pinInput').addEventListener('keydown', (e)=>{ if(e.key 
 document.getElementById('shiftSelect').addEventListener('change', (e)=>{ currentShift = e.target.value; updateSummary(); });
 
 // ================= ABSEN (beranda) =================
+// Nama peserta di Master Data jarang berubah, jadi begitu satu grup pernah
+// berhasil dimuat, nama-namanya dipakai dari cache lokal terus (TIDAK fetch
+// ulang 'getNames' tiap buka Beranda) — cuma 'getHistory' (siapa yang sudah
+// absen HARI INI) yang tetap live tiap kali, karena itu memang berubah tiap hari.
+// Kalau ada penambahan/pengurangan peserta di Master Data, user pakai tombol
+// "↻ Muat Ulang Peserta" (lihat forceReloadParticipants) untuk fetch ulang manual.
 async function loadParticipants(){
   const card = document.getElementById('listCard');
   card.innerHTML = '<div class="loading">Memuat data peserta...</div>';
   openExtras.clear();
+
+  const cachedEntry = await idbGet_('cache', currentGroup).catch(()=>null);
+  const hasCachedNames = !!(cachedEntry && cachedEntry.names && cachedEntry.names.length);
 
   if(!navigator.onLine){
     const shown = await loadParticipantsFromCache_();
@@ -593,8 +608,14 @@ async function loadParticipants(){
   }
 
   try{
+    // Nama: pakai cache kalau ada, baru fetch server kalau ini pertama kali buka grup ini.
+    // Riwayat hari ini: SELALU fetch dari server, ini yang wajib live.
+    const namesPromise = hasCachedNames
+      ? Promise.resolve({ ok: true, names: cachedEntry.names })
+      : fetchJSON_(`${CONFIG.API_URL}?action=getNames&group=${encodeURIComponent(currentGroup)}`);
+
     const [namesData, historyData] = await Promise.all([
-      fetchJSON_(`${CONFIG.API_URL}?action=getNames&group=${encodeURIComponent(currentGroup)}`),
+      namesPromise,
       fetchJSON_(`${CONFIG.API_URL}?action=getHistory&group=${encodeURIComponent(currentGroup)}&date=${encodeURIComponent(todayISO())}`)
     ]);
     if(!namesData.ok) throw new Error(namesData.error || 'Gagal memuat data');
@@ -615,13 +636,13 @@ async function loadParticipants(){
     participants = allParticipants.filter(p => !alreadyToday.has(normalizeName_(p.nama)));
     renderList();
 
-    // simpan snapshot buat dipakai offline nanti (alreadyToday dari server saja, bukan gabungan,
-    // supaya begitu antrean lokal sinkron, statusnya tetap akurat)
+    // simpan/refresh snapshot offline (nama tetap sama kalau dari cache; alreadyToday
+    // selalu yang terbaru dari server, biar status offline nanti akurat)
     idbPut_('cache', {
       group: currentGroup,
       names: namesData.names,
       alreadyToday: Array.from(alreadyTodayServer),
-      cachedAt: Date.now()
+      cachedAt: hasCachedNames ? cachedEntry.cachedAt : Date.now()
     }).catch(()=>{});
   }catch(err){
     const shown = await loadParticipantsFromCache_();
@@ -629,6 +650,24 @@ async function loadParticipants(){
     card.innerHTML = `<div class="empty">Gagal memuat data peserta.<br>${err.message}</div>`;
     showToast('Gagal memuat data peserta', 'error');
   }
+}
+
+// Fetch ulang 'getNames' secara paksa dari server, lalu timpa cache lokal. Dipakai
+// saat Master Data berubah (ada peserta baru/keluar) supaya user tidak perlu tunggu
+// cache kedaluwarsa — karena memang sengaja tidak ada TTL, cache ini bertahan sampai
+// direfresh manual lewat tombol "↻ Muat Ulang" di header. Tidak mengurus UI tombol
+// sendiri — itu tanggung jawab pemanggil (lihat handleRefreshClick_).
+async function forceReloadParticipants(){
+  const namesData = await fetchJSON_(`${CONFIG.API_URL}?action=getNames&group=${encodeURIComponent(currentGroup)}`);
+  if(!namesData.ok) throw new Error(namesData.error || 'Gagal memuat data peserta');
+  const existing = await idbGet_('cache', currentGroup).catch(()=>null);
+  await idbPut_('cache', {
+    group: currentGroup,
+    names: namesData.names,
+    alreadyToday: existing ? existing.alreadyToday : [],
+    cachedAt: Date.now()
+  }).catch(()=>{});
+  await loadParticipants();
 }
 
 function renderList(){
@@ -715,7 +754,7 @@ function renderList(){
 function updateSummary(){
   const filled = participants.filter(p=>p.status).length;
   let label = `${participants.length} peserta &middot; <b>${filled}</b> sudah diisi`;
-  if(skippedTodayCount > 0) label += ` &middot; ${skippedTodayCount} sudah absen hari ini (disembunyikan)`;
+  if(skippedTodayCount > 0) label += ` <span class="skipped-badge">${skippedTodayCount} sudah absen hari ini</span>`;
   document.getElementById('summaryLabel').innerHTML = label;
   const cfg = configFor(currentGroup);
   document.getElementById('saveBtn').disabled = filled === 0 || (cfg.shift && !currentShift);
@@ -729,11 +768,34 @@ document.getElementById('clearAll').addEventListener('click', ()=>{
   participants.forEach(p => { p.status=''; p.catatan=''; p.backupNama=''; p.backupJabatan=''; p.backupCatatan=''; });
   renderList();
 });
-document.getElementById('refreshBtn').addEventListener('click', ()=>{
+// Tombol "↻ Muat Ulang" di header: di Beranda ini FORCE fetch ulang data peserta
+// (bukan cuma baca cache, karena maksud tombol ini memang buat dipakai saat Master
+// Data berubah), di Riwayat ini fetch ulang riwayat. Selalu kasih spinner + teks
+// "Memuat..." selama proses, dan tombol dikunci supaya tidak dobel-klik.
+async function handleRefreshClick_(){
   if(!currentGroup) return;
+  const btn = document.getElementById('refreshBtn');
   const activeView = document.querySelector('.nav-btn.active').dataset.view;
-  if(activeView === 'riwayat') loadHistory(); else loadParticipants();
-});
+  btn.disabled = true;
+  const originalHTML = btn.innerHTML;
+  btn.innerHTML = '<span class="btn-spinner"></span>Memuat...';
+  try{
+    if(activeView === 'riwayat'){
+      historyLoadedOnce = false; // paksa tampilkan status loading di historyCard juga
+      await loadHistory(); // loadHistory sudah urus toast-nya sendiri kalau gagal
+    }else{
+      await forceReloadParticipants(); // begitu juga loadParticipants di dalamnya
+    }
+  }catch(err){
+    // Sampai sini cuma kalau getNames sendiri gagal total (bukan gagal di getHistory,
+    // itu sudah ditangani + di-toast di dalam loadParticipants).
+    showToast('Gagal memuat ulang: ' + err.message, 'error');
+  }finally{
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+  }
+}
+document.getElementById('refreshBtn').addEventListener('click', handleRefreshClick_);
 
 document.getElementById('saveBtn').addEventListener('click', async ()=>{
   const cfg = configFor(currentGroup);
@@ -743,7 +805,8 @@ document.getElementById('saveBtn').addEventListener('click', async ()=>{
 
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
-  btn.textContent = 'Menyimpan...';
+  const saveBtnOriginalHTML = btn.innerHTML;
+  btn.innerHTML = '<span class="btn-spinner"></span>Menyimpan...';
 
   const now = new Date();
   const rows = toSave.map(p => ({
@@ -787,7 +850,12 @@ document.getElementById('saveBtn').addEventListener('click', async ()=>{
     try{
       if(!data.ok) throw new Error(data.error || 'Gagal menyimpan');
       if(data.skipped > 0){
-        showToast(`Tersimpan ${data.saved} · ${data.skipped} dilewati (sudah absen hari ini)`, data.saved > 0 ? 'ok' : 'error');
+        showToast(
+          data.saved > 0
+            ? `Tersimpan ${data.saved} · ${data.skipped} dilewati (sudah absen hari ini)`
+            : `${data.skipped} peserta dilewati — sudah absen hari ini, tidak ada yang disimpan`,
+          'ok'
+        );
       }else{
         showToast(`Berhasil menyimpan ${data.saved} absensi ke "${currentGroup}"`, 'ok');
       }
@@ -801,7 +869,7 @@ document.getElementById('saveBtn').addEventListener('click', async ()=>{
       showToast('Gagal menyimpan: ' + err.message, 'error');
     }
   }
-  btn.textContent = 'Simpan Semua';
+  btn.innerHTML = saveBtnOriginalHTML;
   updateSummary();
 });
 
