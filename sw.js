@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p5m-mkg-v6';
+const CACHE_NAME = 'p5m-mkg-v7';
 const APP_SHELL = [
   './',
   './index.html',
@@ -18,7 +18,7 @@ self.addEventListener('install', (event) => {
       // yang paling penting supaya app tetap bisa dibuka offline.
       Promise.allSettled(
         APP_SHELL.map((url) =>
-          cache.add(url).catch((err) => {
+          cache.add(new Request(url, { cache: 'reload' })).catch((err) => {
             console.warn('[SW] gagal cache:', url, err);
           })
         )

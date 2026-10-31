@@ -430,16 +430,17 @@ const GROUP_CONFIG = {
   "PIT 2C1":     { shift:true,  backup:true  },
   "PIT C1":      { shift:true,  backup:true  },
   "PIT EITA":    { shift:true,  backup:true  },
-  "Workshop 01": { shift:false, backup:false },
+  "Workshop 01": { shift:true,  backup:false, shifts:["Shift 1","Shift 2"] },
   "Workshop 02": { shift:false, backup:false },
   "Workshop 03": { shift:true,  backup:false, shifts:["Shift Pagi","Shift Siang","Shift Malam"] },
   "Logistik":    { shift:true,  backup:false },
   "Admin":       { shift:false, backup:false },
   "Sampler":     { shift:true,  backup:false },
   "Fuel Man":    { shift:false, backup:false },
-  "Kitchen":     { shift:false, backup:false },
+  "Kitchen":     { shift:true,  backup:false, shifts:["Shift 1","Shift 2"] },
   "LAB":         { shift:false, backup:false },
-  "EKSPLORASI":  { shift:false, backup:false }
+  "EKSPLORASI":  { shift:false, backup:false },
+  "Driver LV":   { shift:true,  backup:false, shifts:["Shift 1","Shift 2"] }
 };
 function configFor(group){
   const cfg = GROUP_CONFIG[group] || { shift:false, backup:false };
