@@ -174,6 +174,7 @@
     <div class="group-banner">Riwayat grup: <b id="historyGroupBannerName">-</b></div>
     <div class="toolbar">
       <input type="date" id="historyDateInput" class="btn-ghost" style="padding:7px 10px;">
+      <select class="shift-select hidden" id="historyShiftSelect"><option value="">Semua Shift</option></select>
       <button class="btn-ghost" id="copyHistoryBtn" style="padding:7px 12px;">📋 Salin ke WA</button>
     </div>
     <div class="list-card" id="historyCard">
@@ -896,6 +897,23 @@ let historyEdits = {};
 let historyLoadedOnce = false;
 let historyNeedsReload = true; // true = ada perubahan (baru absen/ganti grup) yang belum tercermin di tab Riwayat
 
+function refreshHistoryShiftSelect(rows){
+  const sel = document.getElementById('historyShiftSelect');
+  const cfg = configFor(currentGroup);
+  sel.classList.toggle('hidden', !cfg.shift);
+  if(!cfg.shift){ sel.innerHTML = ''; return; }
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">Semua Shift</option>' +
+    cfg.shifts.map(sh => `<option value="${sh}">${sh}</option>`).join('');
+  if(prev && cfg.shifts.includes(prev)){
+    sel.value = prev;
+  }else{
+    // otomatis pilih shift kalau data hari itu cuma ada 1 shift
+    const used = [...new Set(rows.map(r => r.shift).filter(Boolean))];
+    if(used.length === 1 && cfg.shifts.includes(used[0])) sel.value = used[0];
+  }
+}
+
 async function loadHistory(){
   if(!currentGroup) return;
   const card = document.getElementById('historyCard');
@@ -912,6 +930,7 @@ async function loadHistory(){
     if(!data.rows || data.rows.length === 0){ card.innerHTML = '<div class="empty">Belum ada riwayat absen pada tanggal ini.</div>'; return; }
     const filled = data.rows.filter(r => r.keterangan && r.keterangan.trim() !== '');
     if(filled.length === 0){ card.innerHTML = '<div class="empty">Belum ada riwayat absen pada tanggal ini.</div>'; return; }
+    refreshHistoryShiftSelect(filled);
     historyRowsCache = filled;
     historyEdits = {};
     filled.forEach((r,i)=>{ historyEdits[i] = { status: r.keterangan, catatan: r.catatan || '' }; });
@@ -920,7 +939,6 @@ async function loadHistory(){
       <div class="history-item">
         <div class="history-top">
           <div class="history-name">${escapeHtml(r.nama)}</div>
-          <div class="history-time">${escapeHtml(r.timestamp)}</div>
         </div>
         ${r.jabatan ? `<div class="history-meta">${escapeHtml(r.jabatan)}${r.shift ? ' · '+escapeHtml(r.shift) : ''}</div>` : ''}
         <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
@@ -1036,6 +1054,31 @@ async function loadHistory(){
 }
 document.getElementById('historyDateInput').addEventListener('change', loadHistory);
 
+function buildAttendanceBlock_(rows){
+  const hadirList = rows.filter(r => r.keterangan === 'HADIR');
+  const nonHadirList = rows.filter(r => r.keterangan !== 'HADIR');
+  let t = `*HADIR (${hadirList.length})*\n`;
+  if(hadirList.length === 0){
+    t += '-\n';
+  }else{
+    hadirList.forEach((r, i) => {
+      const jab = r.jabatan ? ` (${r.jabatan})` : '';
+      t += `${i+1}. ${r.nama}${jab}\n`;
+    });
+  }
+  t += `\n*TIDAK HADIR (${nonHadirList.length})*\n`;
+  if(nonHadirList.length === 0){
+    t += '-\n';
+  }else{
+    nonHadirList.forEach((r, i) => {
+      const jab = r.jabatan ? ` (${r.jabatan})` : '';
+      const catatan = r.catatan ? ` - ${r.catatan}` : '';
+      t += `${i+1}. ${r.nama}${jab}: ${r.keterangan}${catatan}\n`;
+    });
+  }
+  return t;
+}
+
 function buildHistoryReportText(){
   const dateVal = document.getElementById('historyDateInput').value;
   let tanggalLabel = dateVal;
@@ -1043,30 +1086,42 @@ function buildHistoryReportText(){
     const [y,m,d] = dateVal.split('-');
     tanggalLabel = new Date(+y, +m-1, +d).toLocaleDateString('id-ID', { weekday:'long', day:'2-digit', month:'long', year:'numeric' });
   }
-  const hadirList = historyRowsCache.filter(r => r.keterangan === 'HADIR');
-  const nonHadirList = historyRowsCache.filter(r => r.keterangan !== 'HADIR');
+  const cfg = configFor(currentGroup);
+  const shiftSel = cfg.shift ? document.getElementById('historyShiftSelect').value : '';
+  const rowsForReport = shiftSel ? historyRowsCache.filter(r => r.shift === shiftSel) : historyRowsCache;
 
-  let text = `*Laporan Kehadiran P5M*\n\n👥 Grup: ${currentGroup}\n📅 Hari/Tanggal: ${tanggalLabel}\n⏰ Jam: \n📍 Lokasi : \n🧑 Dipimpin oleh: \n\n`;
-
-  text += `*HADIR (${hadirList.length})*\n`;
-  if(hadirList.length === 0){
-    text += '-\n';
-  }else{
-    hadirList.forEach((r, i) => {
-      const jab = r.jabatan ? ` (${r.jabatan})` : '';
-      text += `${i+1}. ${r.nama}${jab}\n`;
+  // Mode "Semua Shift": kelompokkan per shift (urut sesuai daftar shift grup)
+  let sections = null;
+  if(cfg.shift && !shiftSel){
+    const map = new Map();
+    cfg.shifts.forEach(sh => map.set(sh, []));
+    rowsForReport.forEach(r => {
+      const key = r.shift || 'Tanpa Shift';
+      if(!map.has(key)) map.set(key, []);
+      map.get(key).push(r);
     });
+    const groups = [...map.entries()].filter(([, rows]) => rows.length > 0);
+    if(groups.length > 1) sections = groups;
   }
 
-  text += `\n*TIDAK HADIR (${nonHadirList.length})*\n`;
-  if(nonHadirList.length === 0){
-    text += '-\n';
-  }else{
-    nonHadirList.forEach((r, i) => {
-      const jab = r.jabatan ? ` (${r.jabatan})` : '';
-      const catatan = r.catatan ? ` - ${r.catatan}` : '';
-      text += `${i+1}. ${r.nama}${jab}: ${r.keterangan}${catatan}\n`;
+  let shiftLine = '';
+  if(cfg.shift && !sections){
+    const used = [...new Set(rowsForReport.map(r => r.shift).filter(Boolean))];
+    shiftLine = `🔄 Shift: ${shiftSel || used.join(' & ') || 'Semua Shift'}\n`;
+  }else if(sections){
+    shiftLine = `🔄 Shift: Semua Shift\n`;
+  }
+
+  let text = `*Laporan Kehadiran P5M*\n\n👥 Grup: ${currentGroup}\n${shiftLine}📅 Hari/Tanggal: ${tanggalLabel}\n📍 Lokasi : \n🧑 Dipimpin oleh: \n\n`;
+
+  if(sections){
+    sections.forEach(([name, rows], idx) => {
+      text += `━━━━━━━━━━\n🔄 *${name.toUpperCase()}*\n━━━━━━━━━━\n`;
+      text += buildAttendanceBlock_(rows);
+      if(idx < sections.length - 1) text += '\n';
     });
+  }else{
+    text += buildAttendanceBlock_(rowsForReport);
   }
 
   text += `\nMateri P5M: `;
@@ -1091,6 +1146,11 @@ function copyTextFallback(text){
 document.getElementById('copyHistoryBtn').addEventListener('click', async ()=>{
   if(!historyRowsCache || historyRowsCache.length === 0){
     showToast('Belum ada riwayat untuk disalin', 'error');
+    return;
+  }
+  const selShift = document.getElementById('historyShiftSelect').value;
+  if(selShift && !historyRowsCache.some(r => r.shift === selShift)){
+    showToast('Tidak ada data untuk ' + selShift, 'error');
     return;
   }
   const text = buildHistoryReportText();
